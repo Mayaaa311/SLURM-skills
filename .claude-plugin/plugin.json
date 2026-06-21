@@ -1,0 +1,23 @@
+{
+  "name": "pace-skill",
+  "version": "1.0.0",
+  "description": "SLURM job lifecycle agent for Claude Code. Assess cluster → plan allocation → draft sbatch → submit → monitor → debug → report.",
+  "author": {
+    "name": "Yining Yuan",
+    "url": "https://github.com/mayaaa311"
+  },
+  "homepage": "https://github.com/mayaaa311/pace-skill",
+  "repository": "https://github.com/mayaaa311/pace-skill",
+  "license": "MIT",
+  "keywords": [
+    "slurm",
+    "hpc",
+    "gpu",
+    "sbatch",
+    "job-scheduling",
+    "cluster",
+    "pace",
+    "training",
+    "monitoring"
+  ]
+}
