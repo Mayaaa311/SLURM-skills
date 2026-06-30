@@ -2,8 +2,8 @@
 name: pace
 description: "SLURM job lifecycle agent for GPU/HPC clusters. 7-phase pipeline: assess cluster resources → plan GPU/CPU allocation + ETA → draft sbatch → submit → early health check → iterative monitoring → report results. Handles parallel jobs, chained dependencies, and common failure modes. Triggers on: submit job, sbatch, slurm, run training, schedule gpu job, queue experiment, check jobs, monitor jobs, job failed, debug slurm."
 metadata:
-  version: "1.0.0"
-  last_updated: "2026-06-21"
+  version: "1.1.0"
+  last_updated: "2026-06-30"
   status: active
   task_type: hpc-job-management
 ---
@@ -172,6 +172,77 @@ Record all job IDs before moving on.
 
 ---
 
+## Parallel Execution Patterns
+
+When work is embarrassingly parallel — hyperparameter sweeps, multiple seeds, dataset
+variants, or evaluating many checkpoints — **fan out into many single-GPU jobs** instead
+of one long sequential job. If your QoS allows a large queued-job cap with no concurrent
+limit (check `sacctmgr show qos`), parallel submission is the default strategy. 8
+single-GPU jobs finishing in 2h beats one 8-GPU job that doesn't actually scale.
+
+### Pattern A — Independent parallel sbatch (heterogeneous jobs)
+
+Different commands/configs per job. Submit in a loop, capture every ID:
+
+```bash
+declare -A JOBS
+for cfg in configs/run_*.yaml; do
+  name=$(basename "$cfg" .yaml)
+  jid=$(sbatch --parsable --job-name="$name" --export=ALL,CONFIG="$cfg" run.sbatch)
+  JOBS[$name]=$jid
+  echo "submitted $name -> $jid"
+done
+# Monitor all: squeue --me; or  squeue -j $(IFS=,; echo "${JOBS[*]}")
+```
+
+### Pattern B — Job arrays (homogeneous jobs, one script, varying index)
+
+Same script, index selects the variant. `%N` throttles concurrency:
+
+```bash
+#SBATCH --array=0-9%5          # 10 tasks, at most 5 running at once
+#SBATCH --output=logs/%x_%A_%a.out   # %A=array job id, %a=task index
+#SBATCH --error=logs/%x_%A_%a.err
+
+CONFIGS=(configs/run_*.yaml)
+CFG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
+SEED=$SLURM_ARRAY_TASK_ID
+OUT=out/seed_${SEED}             # stagger output dir per task — never share
+mkdir -p "$OUT"
+python train.py --config "$CFG" --seed "$SEED" --out "$OUT"
+```
+Submit: `sbatch run_array.sbatch` → one job ID, N tasks. Cancel one task: `scancel <jobid>_<idx>`.
+
+### Pattern C — Parallel within stages, chained across stages (long pipelines)
+
+Fan out a stage, then gate the next stage on the whole array completing:
+
+```bash
+TRAIN=$(sbatch --parsable --array=0-4 train_array.sbatch)
+# afterok on the array id waits for ALL tasks to succeed
+EVAL=$(sbatch --parsable --dependency=afterok:$TRAIN --array=0-4 eval_array.sbatch)
+```
+
+### Choosing a QoS for parallelism
+
+| Situation | Use |
+|-----------|-----|
+| Many short/medium jobs (each ≤ partition MaxTime) | Your standard/high-throughput QoS — pick the one with the largest queued-job cap and no concurrent limit |
+| A few jobs each needing more wall time than the partition allows | An extended-walltime QoS (often higher priority, but a small submit cap) |
+| Mixed | Split: long jobs on the extended QoS, the rest on the high-throughput QoS |
+
+Check your caps first: `sacctmgr show qos format=name,priority,maxwall,maxsubmitpu -p`.
+
+### Guardrails
+
+- **One GPU per job** unless the job genuinely scales across GPUs — parallel single-GPU jobs use the cluster (and your fairshare) far better.
+- **Throttle arrays with `%`** (e.g. `--array=0-99%10`) to be a good cluster citizen and avoid tanking fairshare.
+- **Unique output/log dirs per task** (`%A_%a`, seed/index suffix) — parallel jobs writing to the same path corrupt each other's results.
+- **Record every job/array ID** at submission — you need them for Phase 5–6 monitoring.
+- Don't exceed your QoS's queued-job cap or `sbatch` will reject submissions.
+
+---
+
 ### Phase 5 — Early Health Check (60–120 seconds after submit)
 
 After ~90 seconds, confirm the jobs aren't immediately crashing:
@@ -273,9 +344,21 @@ Point user to output directories and any generated artifacts (images, checkpoint
 These values should be verified with `scontrol`/`sacctmgr` at the start of each session — cluster configs change.
 
 **Georgia Tech PACE ICE (as of 2026-06):**
-- Partition `coe-gpu`: MaxTime = 16:00:00, H100 GPUs
-- QOS `coe-ice`: used with `coe-gpu`
+- Partition `coe-gpu`: MaxTime = 16:00:00, **H100 ×152 + H200 ×144**, 8 GPU/node, ~2 TB RAM/node
 - GPU request: `--gres=gpu:h100:1`
+
+  QoS options (account `cse`):
+
+  | QoS | Priority | Max Wall | Max Queued Jobs/User | Use when |
+  |-----|----------|----------|----------------------|----------|
+  | `coe-ice`   | 7  | 16:00:00 (partition cap) | 500 | **Default.** Parallel fan-out; no concurrent-job cap |
+  | `coe-grade` | 12 | 24:00:00 (`OverPartQOS`) | 10  | A single run needs > 16h, or you want higher priority |
+  | `pace-grade`| 12 | 24:00:00 | 10 | Same as `coe-grade`, used with `pace-gpu` |
+
+  No `GrpTRES`/`MaxTRESPU` GPU cap on these QoS → concurrent GPU count is governed by
+  fairshare + node availability, not a hard quota. Re-verify with
+  `sacctmgr show qos format=name,priority,maxwall,maxsubmitpu -p` and
+  `sacctmgr show assoc where user=$USER format=qos,maxsubmit -p`.
 - Safe step budget per 16h job: ≤ 12,288 steps (leaves ~15% buffer)
 - Conda env: `/home/hice1/yyuan394/scratch/diffusion`
 - Checkpoint storage: `/storage/ice-shared/bmed-sp-wang/yining/checkpoints/`
